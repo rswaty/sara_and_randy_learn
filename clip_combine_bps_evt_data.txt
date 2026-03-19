@@ -1,0 +1,158 @@
+# -*- coding: utf-8 -*-
+"""
+End-to-end workflow:
+  1) Select one state by NAME from a states layer in the map
+  2) Project it to the raster spatial reference
+  3) Clip BPS & EVT by that state (ExtractByMask)
+  4) Combine the two clipped rasters
+  5) Join ALL attributes from the ORIGINAL BPS/EVT RATs to the Combine table
+
+Run in ArcGIS Pro (Python window or Notebook). Requires Spatial Analyst.
+"""
+
+import os
+import re
+import arcpy
+from arcpy import env
+from arcpy.sa import ExtractByMask, Combine
+
+# ---------------------------
+# USER SETTINGS (edit if needed)
+# ---------------------------
+states_lyr_name = "cb_2018_us_state_500k"   # feature layer in map; has NAME field
+bps_lyr_name    = "LC20_BPS_220.tif"        # ORIGINAL BPS raster layer in map
+evt_lyr_name    = "LC24_EVT_250.tif"        # ORIGINAL EVT raster layer in map
+state_name      = "Alabama"                 # must match a value in NAME
+align_to        = "BPS"                     # "BPS" or "EVT" for snap/cell size
+
+# ---------------------------
+# ENV / PREP
+# ---------------------------
+env.overwriteOutput = True
+arcpy.CheckOutExtension("Spatial")
+
+aprx = arcpy.mp.ArcGISProject("CURRENT")
+home = aprx.homeFolder  # e.g., ...\Documents\ArcGIS\Projects\<YourProject>
+out_gdb = os.path.join(home, "lf_data_test.gdb")
+if not arcpy.Exists(out_gdb):
+    arcpy.management.CreateFileGDB(home, "lf_data_test.gdb")
+
+env.workspace = out_gdb
+env.scratchWorkspace = out_gdb
+
+# ---------------------------
+# HELPERS (minimal)
+# ---------------------------
+def dataset_path_from_layer_name(layer_name: str) -> str:
+    return arcpy.Describe(layer_name).catalogPath
+
+def sql_eq(table_or_layer: str, field: str, value: str) -> str:
+    fld = arcpy.AddFieldDelimiters(table_or_layer, field)
+    v = value.replace("'", "''")
+    return f"{fld} = '{v}'"
+
+def sanitize_to_field_name(name: str, maxlen: int = 10) -> str:
+    s = re.sub(r'[^A-Za-z0-9_]', '_', name)
+    if not s or not s[0].isalpha():
+        s = 'F' + s
+    return s[:maxlen]
+
+# ---------------------------
+# RESOLVE INPUTS FROM MAP
+# ---------------------------
+states_fc = dataset_path_from_layer_name(states_lyr_name)
+bps_src   = dataset_path_from_layer_name(bps_lyr_name)  # ORIGINAL BPS (has full RAT)
+evt_src   = dataset_path_from_layer_name(evt_lyr_name)  # ORIGINAL EVT (has full RAT)
+
+# Alignment
+if align_to.upper() == "EVT":
+    env.snapRaster = evt_src
+    env.cellSize   = evt_src
+else:
+    env.snapRaster = bps_src
+    env.cellSize   = bps_src
+
+# ---------------------------
+# SELECT STATE & PROJECT
+# ---------------------------
+print("Selecting state…")
+state_lyr = "states_sel_lyr"
+arcpy.management.MakeFeatureLayer(states_fc, state_lyr)
+arcpy.management.SelectLayerByAttribute(state_lyr, "NEW_SELECTION", sql_eq(states_fc, "NAME", state_name))
+if int(arcpy.management.GetCount(state_lyr)[0]) != 1:
+    raise RuntimeError("State selection did not return exactly one feature—check NAME/value and layer name.")
+
+print("Projecting state to raster spatial reference…")
+ref_raster = bps_src if align_to.upper() == "BPS" else evt_src
+raster_sr = arcpy.Describe(ref_raster).spatialReference
+sel_state = arcpy.management.CopyFeatures(state_lyr, arcpy.ValidateTableName("sel_state", out_gdb)).getOutput(0)
+sel_state_proj = arcpy.management.Project(sel_state, arcpy.ValidateTableName("sel_state_proj", out_gdb), raster_sr).getOutput(0)
+
+# ---------------------------
+# CLIP BPS & EVT
+# ---------------------------
+base = state_name.lower().replace(" ", "_")
+bps_name = f"bps_{base}"
+evt_name = f"evt_{base}"
+comb_name = f"bps_evt_combine_{base}"
+
+print("Clipping BPS…")
+bps_clip = ExtractByMask(bps_src, sel_state_proj)
+bps_path = os.path.join(out_gdb, bps_name)
+bps_clip.save(bps_path)
+
+print("Clipping EVT…")
+evt_clip = ExtractByMask(evt_src, sel_state_proj)
+evt_path = os.path.join(out_gdb, evt_name)
+evt_clip.save(evt_path)
+
+# Optionally ensure RATs exist on clipped rasters (not required for the final joins)
+arcpy.management.BuildRasterAttributeTable(bps_path, "OVERWRITE")
+arcpy.management.BuildRasterAttributeTable(evt_path, "OVERWRITE")
+
+# ---------------------------
+# COMBINE
+# ---------------------------
+print("Combining rasters…")
+comb_ras = Combine([arcpy.sa.Raster(bps_path), arcpy.sa.Raster(evt_path)])
+comb_path = os.path.join(out_gdb, comb_name)
+comb_ras.save(comb_path)
+
+# ---------------------------
+# FIND COMB KEY FIELDS
+# ---------------------------
+# Combine names the code fields after the *clipped* input dataset base names
+bps_field_in_comb = arcpy.Describe(bps_path).baseName  # e.g., 'bps_alabama'
+evt_field_in_comb = arcpy.Describe(evt_path).baseName  # e.g., 'evt_alabama'
+print(f"Combine key fields: BPS -> {bps_field_in_comb} ; EVT -> {evt_field_in_comb}")
+
+# ---------------------------
+# JOIN ALL ATTRIBUTES FROM ORIGINAL RATs
+# ---------------------------
+print("Joining ALL BPS attributes (from ORIGINAL BPS RAT) to Combine…")
+arcpy.management.JoinField(
+    in_data=comb_path,
+    in_field=bps_field_in_comb,
+    join_table=bps_src,    # join FROM original BPS (full RAT)
+    join_field="VALUE",
+    fields=None            # None => ALL eligible fields
+)
+
+print("Joining ALL EVT attributes (from ORIGINAL EVT RAT) to Combine…")
+arcpy.management.JoinField(
+    in_data=comb_path,
+    in_field=evt_field_in_comb,
+    join_table=evt_src,    # join FROM original EVT (full RAT)
+    join_field="VALUE",
+    fields=None            # None => ALL eligible fields
+)
+
+# ---------------------------
+# REPORT
+# ---------------------------
+print("\nDone. Outputs in lf_data_test.gdb:")
+print(f"  State (projected): {sel_state_proj}")
+print(f"  BPS clip:          {bps_path}")
+print(f"  EVT clip:          {evt_path}")
+print(f"  Combine raster:    {comb_path}")
+print("\nIf the attribute table was open, close and reopen it (or remove/re-add the layer) to refresh the schema.")
