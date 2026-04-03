@@ -28,7 +28,8 @@ from rasterio.warp import Resampling, reproject
 S2_BANDS = ["blue", "green", "red", "nir", "swir16", "swir22", "scl"]
 BAD_SCL_VALUES = {0, 1, 2, 3, 8, 9, 10}
 
-
+#what is between the () and the : tells the system what this function returns, in this case it returns argparse.Namespace
+#This whole block (line 33-42) is a function for running this file in a terminal, with each line being a subcommand
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Download Sentinel-2 and make composites.")
     p.add_argument("--aoi", required=True, help="AOI polygon path (gpkg/shp/geojson).")
@@ -40,7 +41,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-scenes", type=int, default=6, help="Max scenes per period.")
     return p.parse_args()
 
-
+#the elements inside the () are typeends, which indicated what type of data that variable expects.
+#for example, it expects catalog to be a Client (a specific class), and bbox to be a sequence of floats
+#This function is searchcing for whatever is within the 'catalog' that matches the information from all the other components
+#It seems like what it returns is a dictionary, and then turning that into a list
 def search_items(catalog: Client, bbox: Sequence[float], dt: str, max_cloud: float) -> List:
     search = catalog.search(
         collections=["sentinel-2-l2a"],
@@ -49,7 +53,6 @@ def search_items(catalog: Client, bbox: Sequence[float], dt: str, max_cloud: flo
         query={"eo:cloud_cover": {"lt": max_cloud}},
     )
     return list(search.items())
-
 
 def dominant_group(items: Sequence) -> Tuple[Optional[str], Optional[str]]:
     """
@@ -60,21 +63,29 @@ def dominant_group(items: Sequence) -> Tuple[Optional[str], Optional[str]]:
     2) proj:epsg
     3) no grouping (None, None)
     """
+    #the tiles part generates a list, that is what the [] is for. It generates that list through a loop
+    #that looks for when i.properties.get == s2:mgrs_tile. When it finds a matching one, it adds it to a list.
     tiles = [i.properties.get("s2:mgrs_tile") for i in items if i.properties.get("s2:mgrs_tile")]
+    #if it doesn't find any matching properties, it skips this and goes to the next function (epsgs)
     if tiles:
+        #with the list created, it uses the counter function to get a summary of the most common tiles
         return "s2:mgrs_tile", str(Counter(tiles).most_common(1)[0][0])
 
+    #this does the same as the function above, but is only called if tiles is empty.
     epsgs = [i.properties.get("proj:epsg") for i in items if i.properties.get("proj:epsg")]
     if epsgs:
         return "proj:epsg", str(Counter(epsgs).most_common(1)[0][0])
 
+    #if both function run and neither returns anything, it will return None, None
     return None, None
 
-
+#takes whatever items are, and sorts them from lowest cloud clover to the highest cloud cover. If 
+#something doesn't have cloud cover, it assigns it 100, which is full cloud cover.
+#once this sorted list is created, it returns the top 'n' results
 def select_items(items: Sequence, n: int) -> List:
     return sorted(items, key=lambda x: x.properties.get("eo:cloud_cover", 100.0))[:n]
 
-
+#dowloads a file and saves it to a patch after various checks
 def download(url: str, out_path: Path) -> None:
     if out_path.exists() and out_path.stat().st_size > 0:
         return
@@ -86,7 +97,8 @@ def download(url: str, out_path: Path) -> None:
                 if chunk:
                     f.write(chunk)
 
-
+#This downloads all items that match the special bands as determined in the variables at the
+#beginning of the code
 def fetch_assets(items: Sequence, raw_dir: Path) -> List[Dict[str, Path]]:
     out = []
     for item in items:
@@ -99,7 +111,8 @@ def fetch_assets(items: Sequence, raw_dir: Path) -> List[Dict[str, Path]]:
         out.append(rec)
     return out
 
-
+#this is taking the data obtained and putting it into a spacial grid of some sort to layer some information
+#it builds this grid off of an item from te red band
 def build_grid(reference_red: Path, aoi_target: gpd.GeoDataFrame) -> Dict:
     with rasterio.open(reference_red) as src:
         bounds = aoi_target.total_bounds
@@ -116,7 +129,7 @@ def build_grid(reference_red: Path, aoi_target: gpd.GeoDataFrame) -> Dict:
         )
         return {"crs": src.crs, "transform": transform, "height": h, "width": w, "aoi_mask": aoi_mask}
 
-
+#After making this grid, it transformes the coordinate system to line up with the target grid.
 def regrid(path: Path, grid: Dict, resampling: Resampling) -> np.ndarray:
     out = np.full((grid["height"], grid["width"]), np.nan, dtype=np.float32)
     with rasterio.open(path) as src:
@@ -133,7 +146,8 @@ def regrid(path: Path, grid: Dict, resampling: Resampling) -> np.ndarray:
         )
     return out
 
-
+#here it is laying everything on top of each other for pixels that are inside the right
+#bounds and are of good quality
 def composite(assets: List[Dict[str, Path]], grid: Dict) -> Dict[str, np.ndarray]:
     stacks = {b: [] for b in S2_BANDS if b != "scl"}
     for item in assets:
@@ -151,6 +165,7 @@ def composite(assets: List[Dict[str, Path]], grid: Dict) -> Dict[str, np.ndarray
     return comp
 
 
+#creates a list of 2d arrays, outputing the infomration in a compressed way
 def write_multiband(path: Path, arrays: List[np.ndarray], names: List[str], grid: Dict) -> None:
     profile = {
         "driver": "GTiff",
@@ -169,7 +184,8 @@ def write_multiband(path: Path, arrays: List[np.ndarray], names: List[str], grid
             dst.write(arr.astype(np.float32), i)
             dst.set_band_description(i, name)
 
-
+#this saves an 8-bit true-color, displaying the red, blue, and green bands 
+#as a standard rgb image
 def write_rgb(path: Path, comp: Dict[str, np.ndarray], grid: Dict) -> None:
     def stretch(a: np.ndarray, lo: float = 0.02, hi: float = 0.30) -> np.ndarray:
         x = (a - lo) / (hi - lo)
@@ -197,7 +213,13 @@ def write_rgb(path: Path, comp: Dict[str, np.ndarray], grid: Dict) -> None:
         dst.write(g, 2)
         dst.write(b, 3)
 
-
+#the main entrypoint that kicks off everything, and then calls the right functions at the right time.
+#First, it parses the command line arguments, creates the output directory structure,
+#Then is reads the files and derives the bbox
+#For 3 different time periods, it goups the tiles, and tries to select the least cloudy candidates
+#Then it download the band files for all selected scenes, then build the common spatial grid for the first pre-fire scene.
+#Then it buils and writes a median composite for each period.
+#Finally, it writes a tru-color RGB quicklook for each composoite
 def main() -> None:
     args = parse_args()
     outdir = Path(args.outdir)
